@@ -358,7 +358,26 @@
   .peer-role { font-size: 11px; color: var(--muted); font-family: 'DM Mono', monospace; }
 
   .peer-icons { display: flex; gap: 6px; }
-  .peer-icon { font-size: 14px; }
+  .peer-badge {
+    font-family: 'DM Mono', monospace;
+    font-size: 10px;
+    padding: 2px 6px;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+    color: var(--muted);
+  }
+  .peer-badge.on { color: var(--accent); border-color: rgba(0, 229, 160, 0.3); }
+  .peer-avatar { transition: box-shadow 0.1s; }
+  .peer-avatar.speaking { box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--accent); }
+
+  /* Remote screens */
+  .remote-grid { display: flex; flex-direction: column; gap: 16px; }
+
+  .btn.on {
+    background: rgba(0, 229, 160, 0.12);
+    color: var(--accent);
+    border-color: rgba(0, 229, 160, 0.3);
+  }
 
   /* Stats */
   .stat-row {
@@ -570,20 +589,21 @@
   <div class="main-grid">
     <!-- Video section -->
     <div class="video-section">
-      <!-- Remote video -->
-      <div class="video-wrapper" id="remoteWrapper">
-        <div class="video-label">REMOTE</div>
-        <div class="video-quality" id="qualityBadge" style="display:none">1080p · 60fps</div>
-        <video id="remoteVideo" autoplay playsinline></video>
-        <div class="video-placeholder" id="remotePlaceholder">
-          <svg width="48" height="48" viewBox="0 0 48 48" fill="none">
-            <rect x="2" y="10" width="44" height="28" rx="4" stroke="currentColor" stroke-width="2"/>
-            <path d="M32 24L20 17v14l12-7z" fill="currentColor"/>
-          </svg>
-          <p>Waiting for remote stream…</p>
+      <!-- Remote screens (one tile per participant sharing) -->
+      <div class="remote-grid" id="remoteGrid">
+        <div class="video-wrapper" id="remotePlaceholder">
+          <div class="video-label">REMOTE</div>
+          <div class="video-placeholder">
+            <svg width="48" height="48" viewBox="0 0 48 48" fill="none">
+              <rect x="2" y="10" width="44" height="28" rx="4" stroke="currentColor" stroke-width="2"/>
+              <path d="M32 24L20 17v14l12-7z" fill="currentColor"/>
+            </svg>
+            <p>Waiting for remote stream…</p>
+          </div>
         </div>
-        <button class="fullscreen-btn" onclick="toggleFullscreen()" title="Fullscreen">⛶</button>
       </div>
+      <!-- Remote voice streams play here -->
+      <div id="audioSink" hidden></div>
 
       <!-- Local preview -->
       <div class="video-wrapper" id="localWrapper" style="aspect-ratio: 16/4;">
@@ -602,6 +622,12 @@
       <div class="controls-bar">
         <button class="btn btn-primary" id="shareBtn" onclick="startSharing()">
           <span>🖥️</span> Share Screen
+        </button>
+        <button class="btn" id="micBtn" onclick="toggleMic()" disabled>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+            <rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v4"/>
+          </svg>
+          <span id="micLabel">Join Voice</span>
         </button>
         <button class="btn" id="audioBtn" onclick="toggleAudio()" disabled>
           <span id="audioIcon">🔊</span> <span id="audioLabel">Mute</span>
@@ -702,29 +728,36 @@
 
 <script>
 // ─── WebRTC + Signaling via PeerJS (free hosted STUN/TURN) ───────────────────
-// We use PeerJS which wraps WebRTC with a simple signaling server.
-// PeerJS CDN is loaded dynamically.
+// PeerJS is only used for signaling: once connected, peers talk directly.
+//
+// Topology: full mesh. The host has a well-known id (sw-host-CODE). A guest
+// connects to the host, the host replies with the list of participants, and
+// the guest connects to each of them. Whenever a data connection opens, both
+// sides call each other with whatever they are currently streaming (screen,
+// voice), so late joiners see ongoing streams.
 
 let peer = null;
-let conn = null;         // data channel
-let mediaConn = null;   // media stream connection
-let localStream = null;
+let localStream = null;  // screen capture
+let micStream = null;    // voice
 let isMuted = false;
 let isHost = false;
+let hostId = null;
 let currentMode = 'host';
 let audioCtx = null;
 let analyser = null;
 let animFrame = null;
 let statsInterval = null;
 
-const PEER_KEY = ''; // uses PeerJS free cloud server
+const peers = new Map();    // peerId -> { conn, open }
+const outCalls = new Map(); // `${peerId}:${kind}` -> MediaConnection we started
+const remotes = new Map();  // `${peerId}:${kind}` -> { peerId, kind, call, stream, el, analyser }
 
 // ─── Load PeerJS ─────────────────────────────────────────────────────────────
 function loadPeerJS() {
   return new Promise((res, rej) => {
     if (window.Peer) { res(); return; }
     const s = document.createElement('script');
-    s.src = 'https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js';
+    s.src = 'https://unpkg.com/peerjs@1.5.5/dist/peerjs.min.js';
     s.onload = res;
     s.onerror = rej;
     document.head.appendChild(s);
@@ -761,6 +794,15 @@ function setStatus(label, dotClass) {
   dot.className = 'status-dot ' + dotClass;
 }
 
+function refreshStatus() {
+  if (!peer || !peer.id) return;
+  const live = localStream || [...remotes.values()].some(r => r.kind === 'screen');
+  if (live) setStatus('LIVE', 'active');
+  else if (openPeerIds().length) setStatus('CONNECTED', 'active');
+  else if (isHost) setStatus('WAITING FOR PEER', 'waiting');
+  else setStatus('DISCONNECTED', 'error');
+}
+
 // ─── Mode toggle ─────────────────────────────────────────────────────────────
 function setMode(mode) {
   currentMode = mode;
@@ -787,6 +829,38 @@ function copyRoomId() {
   navigator.clipboard.writeText(id).then(() => notify('Room code copied!'));
 }
 
+const isHostId = id => id.startsWith('sw-host-');
+const peerLabel = id => isHostId(id) ? 'Host' : 'Guest ' + id.replace(/[^a-z0-9]/gi, '').slice(-4).toUpperCase();
+const openPeerIds = () => [...peers].filter(([, p]) => p.open).map(([id]) => id);
+
+// ─── Session setup / teardown ────────────────────────────────────────────────
+function bindPeer() {
+  peer.on('connection', setupConnection);
+  peer.on('call', handleIncomingCall);
+  // Losing the signaling server does not affect established P2P links, but we
+  // need it back so new people can still join.
+  peer.on('disconnected', () => {
+    if (peer && !peer.destroyed) {
+      log('Signaling lost, reconnecting…', 'warn');
+      peer.reconnect();
+    }
+  });
+}
+
+function leaveSession() {
+  if (!peer) return;
+  for (const key of [...remotes.keys()]) removeRemote(key);
+  for (const call of outCalls.values()) call.close();
+  outCalls.clear();
+  peers.clear();
+  peer.destroy();
+  peer = null;
+  hostId = null;
+  isHost = false;
+  document.getElementById('micBtn').disabled = true;
+  refreshPeerList();
+}
+
 // ─── Create Room (Host) ───────────────────────────────────────────────────────
 async function createRoom() {
   const btn = document.getElementById('createBtn');
@@ -797,41 +871,24 @@ async function createRoom() {
 
   try {
     await loadPeerJS();
+    leaveSession();
     const roomId = genRoomId();
     document.getElementById('roomIdDisplay').textContent = roomId;
 
-    peer = new Peer('sw-host-' + roomId, {
-      debug: 0
-    });
+    isHost = true;
+    hostId = 'sw-host-' + roomId;
+    peer = new Peer(hostId, { debug: 0 });
+    bindPeer();
 
-    peer.on('open', (id) => {
+    peer.on('open', () => {
       log(`Room created: ${roomId}`, 'success');
-      setStatus('WAITING FOR PEER', 'waiting');
       notify('Room created! Share code ' + roomId, 'success');
-      isHost = true;
       spinner.classList.remove('active');
       btn.textContent = '⟳ New Room';
       btn.disabled = false;
-      updatePeerList('You (Host)', 'host');
-    });
-
-    peer.on('connection', (c) => {
-      conn = c;
-      log('Data channel connected', 'success');
-      setupDataChannel(conn);
-    });
-
-    peer.on('call', (call) => {
-      mediaConn = call;
-      call.answer(); // answer with no stream (receiver)
-      call.on('stream', (remoteStream) => {
-        log('Receiving remote stream', 'success');
-        showRemoteStream(remoteStream);
-      });
-      call.on('close', () => {
-        log('Call ended', 'warn');
-        clearRemoteStream();
-      });
+      document.getElementById('micBtn').disabled = false;
+      refreshStatus();
+      refreshPeerList();
     });
 
     peer.on('error', (err) => {
@@ -861,53 +918,32 @@ async function joinRoom() {
 
   try {
     await loadPeerJS();
-    const myId = 'sw-guest-' + genRoomId();
-    peer = new Peer(myId, { debug: 0 });
+    leaveSession();
+    isHost = false;
+    hostId = 'sw-host-' + input;
+    peer = new Peer({ debug: 0 });
+    bindPeer();
 
     peer.on('open', () => {
       log(`Connecting to room ${input}…`);
       setStatus('CONNECTING…', 'waiting');
-      const hostId = 'sw-host-' + input;
-
-      conn = peer.connect(hostId, { reliable: true });
-      setupDataChannel(conn);
-
-      conn.on('open', () => {
-        log('Data channel open', 'success');
-        setStatus('CONNECTED', 'active');
-        notify('Connected to room ' + input, 'success');
-        isHost = false;
-        spinner.classList.remove('active');
-        btn.disabled = false;
-        updatePeerList('You (Guest)', 'guest');
-        document.getElementById('connHint').textContent = 'Connected! Ask host to share screen.';
-      });
-
-      conn.on('error', (err) => {
-        log('Connection error: ' + err, 'error');
-        spinner.classList.remove('active');
-        btn.disabled = false;
-        setStatus('ERROR', 'error');
-        notify('Could not connect. Check the code.', 'error');
-      });
-
-      // Host may call us if they share their screen
-      peer.on('call', (call) => {
-        mediaConn = call;
-        call.answer();
-        call.on('stream', (remoteStream) => {
-          log('Receiving remote stream', 'success');
-          showRemoteStream(remoteStream);
-        });
-        call.on('close', clearRemoteStream);
-      });
+      connectTo(hostId);
     });
 
     peer.on('error', (err) => {
-      log('Peer error: ' + err.message, 'error');
-      notify('Connection failed: ' + err.type, 'error');
       spinner.classList.remove('active');
       btn.disabled = false;
+      if (err.type === 'peer-unavailable') {
+        // Only fatal if we could not reach the host itself.
+        if (!peers.get(hostId)?.open) {
+          log(`Room ${input} not found`, 'error');
+          notify('Room not found. Check the code.', 'error');
+          setStatus('ERROR', 'error');
+        }
+        return;
+      }
+      log('Peer error: ' + err.message, 'error');
+      notify('Connection failed: ' + err.type, 'error');
     });
 
   } catch (e) {
@@ -917,23 +953,188 @@ async function joinRoom() {
   }
 }
 
-// ─── Data channel ─────────────────────────────────────────────────────────────
-function setupDataChannel(c) {
+function onJoinedHost() {
+  const input = hostId.slice('sw-host-'.length);
+  notify('Connected to room ' + input, 'success');
+  document.getElementById('joinSpinner').classList.remove('active');
+  document.getElementById('joinBtn').disabled = false;
+  document.getElementById('micBtn').disabled = false;
+  document.getElementById('connHint').textContent = 'Connected! Share your screen or join voice.';
+}
+
+// ─── Data connections (mesh) ──────────────────────────────────────────────────
+function connectTo(id) {
+  if (!peer || id === peer.id || peers.has(id)) return;
+  setupConnection(peer.connect(id, { reliable: true }));
+}
+
+function setupConnection(c) {
+  const id = c.peer;
+  const existing = peers.get(id);
+  if (existing?.open && existing.conn !== c) {
+    // Both sides dialed at the same time: keep the first one that opened.
+    c.on('open', () => c.close());
+    return;
+  }
+  peers.set(id, { conn: c, open: false });
+
   c.on('open', () => {
-    if (!isHost) return; // host sets status in call handler
-    setStatus('CONNECTED', 'active');
-    updatePeerList('You (Host)', 'host', 'Friend');
+    const p = peers.get(id);
+    if (!p || p.conn !== c) return;
+    p.open = true;
+    log(`${peerLabel(id)} connected`, 'success');
+
+    if (isHost) {
+      // Tell the newcomer who else is here so it can connect to everyone.
+      const others = openPeerIds().filter(o => o !== id);
+      c.send(JSON.stringify({ type: 'roster', peers: others }));
+    }
+    if (!isHost && id === hostId) onJoinedHost();
+
+    sendMyStreams(id);
+
+    c.peerConnection?.addEventListener('connectionstatechange', () => {
+      const s = c.peerConnection?.connectionState;
+      if (s === 'failed' || s === 'closed') dropPeer(id, c);
+    });
+
+    refreshPeerList();
+    refreshStatus();
   });
+
   c.on('data', (data) => {
     const msg = JSON.parse(data);
+    if (msg.type === 'roster') msg.peers.forEach(connectTo);
+    if (msg.type === 'stream-ended') removeRemote(`${id}:${msg.kind}`);
     if (msg.type === 'chat') log('Peer: ' + msg.text);
     if (msg.type === 'ping') c.send(JSON.stringify({ type: 'pong', t: msg.t }));
   });
-  c.on('close', () => {
-    log('Peer disconnected', 'warn');
-    setStatus('DISCONNECTED', 'error');
-    clearRemoteStream();
+
+  c.on('close', () => dropPeer(id, c));
+  c.on('error', (err) => log(`Connection error with ${peerLabel(id)}: ${err}`, 'error'));
+}
+
+function dropPeer(id, c) {
+  const p = peers.get(id);
+  if (!p || p.conn !== c) return;
+  peers.delete(id);
+  removeRemote(`${id}:screen`);
+  removeRemote(`${id}:voice`);
+  for (const kind of ['screen', 'voice']) {
+    outCalls.get(`${id}:${kind}`)?.close();
+    outCalls.delete(`${id}:${kind}`);
+  }
+  if (p.open) {
+    log(`${peerLabel(id)} disconnected`, 'warn');
+    if (id === hostId) log('Host left — current participants stay connected, but nobody new can join', 'warn');
+  }
+  refreshPeerList();
+  refreshStatus();
+}
+
+function broadcast(msg) {
+  const data = JSON.stringify(msg);
+  for (const [, p] of peers) if (p.open) p.conn.send(data);
+}
+
+// ─── Media calls ──────────────────────────────────────────────────────────────
+function sendMyStreams(id) {
+  if (localStream) callPeer(id, 'screen', localStream);
+  if (micStream) callPeer(id, 'voice', micStream);
+}
+
+function callPeer(id, kind, stream) {
+  const key = `${id}:${kind}`;
+  if (outCalls.has(key)) return;
+  const call = peer.call(id, stream, { metadata: { kind } });
+  outCalls.set(key, call);
+  call.on('close', () => { if (outCalls.get(key) === call) outCalls.delete(key); });
+  call.on('error', (err) => log(`Call error (${kind}) with ${peerLabel(id)}: ${err}`, 'error'));
+}
+
+function stopOutgoing(kind) {
+  for (const [key, call] of outCalls) {
+    if (key.endsWith(':' + kind)) { call.close(); outCalls.delete(key); }
+  }
+  broadcast({ type: 'stream-ended', kind });
+}
+
+function handleIncomingCall(call) {
+  const kind = call.metadata?.kind === 'voice' ? 'voice' : 'screen';
+  call.answer(); // receive only; we send our own streams with our own calls
+  call.on('stream', (stream) => addRemote(call.peer, kind, call, stream));
+  call.on('close', () => {
+    const r = remotes.get(`${call.peer}:${kind}`);
+    if (r && r.call === call) removeRemote(`${call.peer}:${kind}`);
   });
+}
+
+// ─── Remote streams ───────────────────────────────────────────────────────────
+function addRemote(peerId, kind, call, stream) {
+  const key = `${peerId}:${kind}`;
+  const existing = remotes.get(key);
+  if (existing && existing.call === call) return; // 'stream' fires once per track
+  if (existing) removeRemote(key);
+
+  const entry = { peerId, kind, call, stream, el: null, analyser: null };
+  if (kind === 'screen') {
+    entry.el = createScreenTile(peerId, stream);
+    document.getElementById('remoteGrid').appendChild(entry.el);
+    document.getElementById('remotePlaceholder').style.display = 'none';
+    log(`Receiving ${peerLabel(peerId)}'s screen`, 'success');
+  } else {
+    const audio = document.createElement('audio');
+    audio.autoplay = true;
+    audio.srcObject = stream;
+    document.getElementById('audioSink').appendChild(audio);
+    entry.el = audio;
+    entry.analyser = createLevelAnalyser(stream);
+    log(`${peerLabel(peerId)} joined voice`, 'success');
+  }
+  remotes.set(key, entry);
+  if (kind === 'screen') startStatsPolling();
+  refreshPeerList();
+  refreshStatus();
+}
+
+function removeRemote(key) {
+  const r = remotes.get(key);
+  if (!r) return;
+  remotes.delete(key);
+  r.el.srcObject = null;
+  r.el.remove();
+  r.analyser?.source.disconnect();
+  r.call.close();
+  if (r.kind === 'voice') log(`${peerLabel(r.peerId)} left voice`, 'warn');
+  if (r.kind === 'screen') log(`${peerLabel(r.peerId)} stopped sharing`, 'warn');
+
+  const anyScreen = [...remotes.values()].some(x => x.kind === 'screen');
+  if (!anyScreen) {
+    document.getElementById('remotePlaceholder').style.display = '';
+    if (statsInterval) { clearInterval(statsInterval); statsInterval = null; }
+  }
+  refreshPeerList();
+  refreshStatus();
+}
+
+function createScreenTile(peerId, stream) {
+  const tile = document.createElement('div');
+  tile.className = 'video-wrapper active';
+  tile.innerHTML = `
+    <div class="video-label"></div>
+    <div class="video-quality" style="display:none"></div>
+    <video class="visible" autoplay playsinline></video>
+    <button class="fullscreen-btn" title="Fullscreen">⛶</button>`;
+  tile.querySelector('.video-label').textContent = peerLabel(peerId);
+  const vid = tile.querySelector('video');
+  vid.srcObject = stream;
+  const badge = tile.querySelector('.video-quality');
+  vid.addEventListener('resize', () => {
+    badge.textContent = `${vid.videoWidth}×${vid.videoHeight}`;
+    badge.style.display = '';
+  });
+  tile.querySelector('.fullscreen-btn').onclick = () => toggleFullscreen(tile);
+  return tile;
 }
 
 // ─── Screen sharing ───────────────────────────────────────────────────────────
@@ -962,22 +1163,18 @@ async function startSharing() {
 
     log('Screen capture started', 'success');
 
-    // Stream to peer
-    if (conn && conn.open) {
-      const targetId = conn.peer;
-      mediaConn = peer.call(targetId, localStream);
-      mediaConn.on('stream', (remoteStream) => {
-        // If peer also shares
-        showRemoteStream(remoteStream);
-      });
-      log('Streaming to peer…', 'success');
-      setStatus('LIVE', 'active');
-      document.getElementById('qualityBadge').style.display = '';
+    // Stream to everyone already here; newcomers get it when they connect.
+    const targets = openPeerIds();
+    targets.forEach(id => callPeer(id, 'screen', localStream));
+    if (targets.length) {
+      log(`Streaming to ${targets.length} peer(s)…`, 'success');
       notify('Now sharing your screen!', 'success');
     } else {
-      log('No peer connected yet — stream ready when they join', 'warn');
-      notify('Stream ready. Connect a peer to broadcast.', 'success');
+      log('No peer connected yet — they will get the stream when they join', 'warn');
+      notify('Stream ready. Peers will see it when they join.', 'success');
     }
+    refreshPeerList();
+    refreshStatus();
 
     // Handle user stopping via browser UI
     localStream.getVideoTracks()[0].addEventListener('ended', () => {
@@ -996,14 +1193,10 @@ async function startSharing() {
 }
 
 function stopSharing() {
-  if (localStream) {
-    localStream.getTracks().forEach(t => t.stop());
-    localStream = null;
-  }
-  if (mediaConn) {
-    mediaConn.close();
-    mediaConn = null;
-  }
+  if (!localStream) return;
+  localStream.getTracks().forEach(t => t.stop());
+  localStream = null;
+  stopOutgoing('screen');
   const localVid = document.getElementById('localVideo');
   localVid.srcObject = null;
   localVid.classList.remove('visible');
@@ -1012,33 +1205,74 @@ function stopSharing() {
   document.getElementById('shareBtn').disabled = false;
   document.getElementById('stopBtn').disabled = true;
   document.getElementById('audioBtn').disabled = true;
-  document.getElementById('qualityBadge').style.display = 'none';
   clearAudioMeter();
   log('Screen share stopped', 'warn');
   notify('Screen sharing stopped');
+  refreshPeerList();
+  refreshStatus();
 }
 
-// ─── Remote stream ────────────────────────────────────────────────────────────
-function showRemoteStream(stream) {
-  const vid = document.getElementById('remoteVideo');
-  vid.srcObject = stream;
-  vid.classList.add('visible');
-  document.getElementById('remotePlaceholder').style.display = 'none';
-  document.getElementById('remoteWrapper').classList.add('active');
-  document.getElementById('qualityBadge').style.display = '';
-  setStatus('LIVE', 'active');
-  startStatsPolling(vid);
+// ─── Voice ────────────────────────────────────────────────────────────────────
+let micAnalyser = null;
+
+async function toggleMic() {
+  const btn = document.getElementById('micBtn');
+  if (micStream) {
+    micStream.getTracks().forEach(t => t.stop());
+    micStream = null;
+    micAnalyser?.source.disconnect();
+    micAnalyser = null;
+    stopOutgoing('voice');
+    btn.classList.remove('on');
+    document.getElementById('micLabel').textContent = 'Join Voice';
+    log('Left voice', 'warn');
+    refreshPeerList();
+    return;
+  }
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+    });
+    micAnalyser = createLevelAnalyser(micStream);
+    openPeerIds().forEach(id => callPeer(id, 'voice', micStream));
+    btn.classList.add('on');
+    document.getElementById('micLabel').textContent = 'Leave Voice';
+    log('Joined voice', 'success');
+    refreshPeerList();
+  } catch (e) {
+    log('Microphone unavailable: ' + e.message, 'error');
+    notify('Could not access microphone', 'error');
+  }
 }
 
-function clearRemoteStream() {
-  const vid = document.getElementById('remoteVideo');
-  vid.srcObject = null;
-  vid.classList.remove('visible');
-  document.getElementById('remotePlaceholder').style.display = '';
-  document.getElementById('remoteWrapper').classList.remove('active');
-  document.getElementById('qualityBadge').style.display = 'none';
-  if (statsInterval) { clearInterval(statsInterval); statsInterval = null; }
+// Speaking indicators: one shared AudioContext, one analyser per voice stream.
+let levelCtx = null;
+
+function createLevelAnalyser(stream) {
+  levelCtx ??= new (window.AudioContext || window.webkitAudioContext)();
+  levelCtx.resume();
+  const source = levelCtx.createMediaStreamSource(stream);
+  const node = levelCtx.createAnalyser();
+  node.fftSize = 256;
+  source.connect(node);
+  return { source, node, buf: new Uint8Array(node.fftSize) };
 }
+
+function isSpeaking(a) {
+  if (!a) return false;
+  a.node.getByteTimeDomainData(a.buf);
+  let sum = 0;
+  for (const v of a.buf) sum += (v - 128) ** 2;
+  return Math.sqrt(sum / a.buf.length) > 4;
+}
+
+setInterval(() => {
+  document.querySelectorAll('.peer-avatar[data-peer]').forEach(el => {
+    const id = el.dataset.peer;
+    const a = id === peer?.id ? micAnalyser : remotes.get(`${id}:voice`)?.analyser;
+    el.classList.toggle('speaking', isSpeaking(a));
+  });
+}, 100);
 
 // ─── Audio ────────────────────────────────────────────────────────────────────
 function toggleAudio() {
@@ -1089,14 +1323,16 @@ function clearAudioMeter() {
 }
 
 // ─── Stats polling ────────────────────────────────────────────────────────────
+// Shows stats for the first remote screen being received.
 let prevBytes = 0;
 let prevTime = 0;
 
-function startStatsPolling(videoEl) {
-  if (statsInterval) clearInterval(statsInterval);
+function startStatsPolling() {
+  if (statsInterval) return;
   statsInterval = setInterval(async () => {
-    if (!mediaConn || !mediaConn.peerConnection) return;
-    const pc = mediaConn.peerConnection;
+    const screen = [...remotes.values()].find(r => r.kind === 'screen');
+    const pc = screen?.call.peerConnection;
+    if (!pc) return;
     try {
       const stats = await pc.getStats();
       stats.forEach(report => {
@@ -1105,7 +1341,7 @@ function startStatsPolling(videoEl) {
           const loss = report.packetsLost || 0;
           const bytes = report.bytesReceived || 0;
           const now = Date.now();
-          const bw = prevTime ? ((bytes - prevBytes) * 8 / ((now - prevTime) / 1000) / 1000).toFixed(0) : 0;
+          const bw = prevTime && bytes >= prevBytes ? ((bytes - prevBytes) * 8 / ((now - prevTime) / 1000) / 1000).toFixed(0) : 0;
           prevBytes = bytes; prevTime = now;
 
           document.getElementById('statFps').textContent = fps.toFixed(0);
@@ -1125,39 +1361,53 @@ function startStatsPolling(videoEl) {
 }
 
 // ─── Peer list ────────────────────────────────────────────────────────────────
-function updatePeerList(myLabel, myRole, peerLabel) {
+function refreshPeerList() {
   const el = document.getElementById('peerList');
-  let html = '';
-  const me = { name: myLabel, role: myRole, initial: myLabel[0] };
-  html += peerCard(me);
-  if (peerLabel) {
-    html += peerCard({ name: peerLabel, role: myRole === 'host' ? 'guest' : 'host', initial: 'F' });
+  if (!peer || !peer.id) {
+    el.innerHTML = `<div style="font-size:13px;color:var(--muted);font-family:'DM Mono',monospace">No one connected yet</div>`;
+    return;
   }
-  el.innerHTML = html;
+  const rows = [{
+    id: peer.id,
+    name: `You (${isHost ? 'Host' : 'Guest'})`,
+    role: isHost ? 'host' : 'guest',
+    voice: !!micStream,
+    screen: !!localStream
+  }];
+  for (const id of openPeerIds()) {
+    rows.push({
+      id,
+      name: peerLabel(id),
+      role: isHostId(id) ? 'host' : 'guest',
+      voice: remotes.has(`${id}:voice`),
+      screen: remotes.has(`${id}:screen`)
+    });
+  }
+  el.innerHTML = rows.map(peerCard).join('');
 }
 
 function peerCard(p) {
   return `<div class="peer-item">
-    <div class="peer-avatar">${p.initial}</div>
+    <div class="peer-avatar" data-peer="${p.id}">${p.name[0]}</div>
     <div class="peer-info">
       <div class="peer-name">${p.name}</div>
       <div class="peer-role">${p.role.toUpperCase()}</div>
     </div>
     <div class="peer-icons">
-      <span class="peer-icon">🎤</span>
-      <span class="peer-icon">🖥</span>
+      <span class="peer-badge ${p.voice ? 'on' : ''}">MIC</span>
+      <span class="peer-badge ${p.screen ? 'on' : ''}">SCREEN</span>
     </div>
   </div>`;
 }
 
 // ─── Fullscreen ───────────────────────────────────────────────────────────────
-function toggleFullscreen() {
-  const el = document.getElementById('remoteWrapper');
+function toggleFullscreen(el) {
   if (!document.fullscreenElement) el.requestFullscreen?.();
   else document.exitFullscreen?.();
 }
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
+window.addEventListener('beforeunload', () => peer?.destroy());
 log('SHAREWAVE ready — create or join a room', 'success');
 setStatus('OFFLINE', '');
 </script>
